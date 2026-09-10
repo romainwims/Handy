@@ -43,29 +43,77 @@ jobs:
           printf '#![allow(dead_code)]\n#[path = "%s/src-tauri/src/audio_toolkit/text.rs"]\nmod text;\n' "$GITHUB_WORKSPACE" > "$CRATE/src/lib.rs"
           cd "$CRATE" && cargo test
 
+  # Upstream's reusable build.yml always exports APPLE_CERTIFICATE to
+  # tauri-action (as an empty string when not signing), which makes Tauri
+  # attempt a certificate import and fail. Building directly leaves it unset,
+  # so Tauri falls back to the ad-hoc signature from tauri.conf.json.
   build:
     needs: spoken-punctuation-tests
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: "macos-26" # Apple Silicon (M1 and above)
-            args: "--target aarch64-apple-darwin"
             target: "aarch64-apple-darwin"
           - platform: "macos-latest" # Intel
-            args: "--target x86_64-apple-darwin"
             target: "x86_64-apple-darwin"
-    uses: ./.github/workflows/build.yml
-    with:
-      platform: ${{ matrix.platform }}
-      target: ${{ matrix.target }}
-      build-args: ${{ matrix.args }}
-      sign-binaries: false
-      asset-prefix: "handy-ponctuation"
-      upload-artifacts: true
-    secrets: inherit
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: ${{ matrix.platform }}-${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      # Same as upstream build.yml: there is no prebuilt ONNX Runtime for
+      # Intel Macs, so link it dynamically and bundle the dylib.
+      - name: Install ONNX Runtime (Intel)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          ORT_VERSION="1.24.2"
+          curl -L -o ort.tgz "https://blob.handy.computer/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          tar xzf ort.tgz
+          ORT_DIR="$(pwd)/onnxruntime-osx-x86_64-${ORT_VERSION}"
+          echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> $GITHUB_ENV
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> $GITHUB_ENV
+          jq --arg lib "$ORT_DIR/lib/libonnxruntime.${ORT_VERSION}.dylib" \
+            '.bundle.macOS.frameworks = [$lib]' \
+            src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
+
+      - name: Build
+        run: bun run tauri build --target ${{ matrix.target }}
+
+      - name: Verify bundled dylibs (Intel)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          APP=$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
+          otool -L "$APP/Contents/MacOS/handy" | grep '@rpath/' | awk '{print $1}' | while read dep; do
+            libname=$(basename "$dep")
+            if [ ! -f "$APP/Contents/Frameworks/$libname" ]; then
+              echo "MISSING: $libname not found in Frameworks/"
+              exit 1
+            fi
+            echo "OK: $libname"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: handy-ponctuation-${{ matrix.target }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30
 
   release:
     needs: build

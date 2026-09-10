@@ -1,9 +1,18 @@
 name: "Build ponctuation dictée (macOS)"
 
-# Unsigned macOS build of this fork, published as a GitHub release so the
-# .dmg can be downloaded without a GitHub account. Upstream's build workflows
-# require the maintainer's Apple and updater signing secrets, which a fork
-# does not have.
+# macOS build of this fork, published as a GitHub release so the .dmg can be
+# downloaded without a GitHub account and installed apps can self-update from
+# latest.json. Upstream's build workflows require the maintainer's Apple
+# Developer ID and updater secrets, which a fork does not have; this fork
+# signs with its own self-signed certificate and updater key instead.
+#
+# Secrets:
+#   HANDY_SIGNING_P12 / HANDY_SIGNING_P12_PASSWORD — base64 .p12 of the
+#     self-signed code signing certificate (.github/handy-signing-cert.pem).
+#     A stable certificate keeps macOS Microphone/Accessibility grants across
+#     updates; ad-hoc signatures change on every build and reset them.
+#   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD — updater
+#     key matching plugins.updater.pubkey in tauri.conf.json.
 
 on:
   push:
@@ -45,8 +54,7 @@ jobs:
 
   # Upstream's reusable build.yml always exports APPLE_CERTIFICATE to
   # tauri-action (as an empty string when not signing), which makes Tauri
-  # attempt a certificate import and fail. Building directly leaves it unset,
-  # so Tauri falls back to the ad-hoc signature from tauri.conf.json.
+  # attempt a certificate import and fail. Building directly avoids that.
   build:
     needs: spoken-punctuation-tests
     strategy:
@@ -55,9 +63,13 @@ jobs:
         include:
           - platform: "macos-26" # Apple Silicon (M1 and above)
             target: "aarch64-apple-darwin"
+            arch: "aarch64"
           - platform: "macos-latest" # Intel
             target: "x86_64-apple-darwin"
+            arch: "x64"
     runs-on: ${{ matrix.platform }}
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.HANDY_SIGNING_P12 != '' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -77,6 +89,17 @@ jobs:
       - name: Install frontend dependencies
         run: bun install
 
+      # The updater only installs strictly newer versions, so every build gets
+      # PATCH * 1000 + run number (0.9.6 -> 0.9.6005). Merged upstream bumps
+      # keep the ordering (0.9.7 -> 0.9.7xxx).
+      - name: Set release version
+        run: |
+          BASE=$(jq -r .version src-tauri/tauri.conf.json)
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
+          VERSION="$MAJOR.$MINOR.$((PATCH * 1000 + ${{ github.run_number }}))"
+          jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
+          echo "Building version $VERSION"
+
       # Same as upstream build.yml: there is no prebuilt ONNX Runtime for
       # Intel Macs, so link it dynamically and bundle the dylib.
       - name: Install ONNX Runtime (Intel)
@@ -91,14 +114,54 @@ jobs:
           jq --arg lib "$ORT_DIR/lib/libonnxruntime.${ORT_VERSION}.dylib" \
             '.bundle.macOS.frameworks = [$lib]' \
             src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
+          # Hardened runtime library validation expects the bundled dylib to
+          # share an Apple Team ID, which a self-signed certificate lacks.
+          plutil -insert com.apple.security.cs.disable-library-validation -bool true src-tauri/Entitlements.plist
+
+      - name: Import signing certificate
+        if: env.HAS_SIGNING_CERT == 'true'
+        env:
+          CERT_P12: ${{ secrets.HANDY_SIGNING_P12 }}
+          CERT_PASSWORD: ${{ secrets.HANDY_SIGNING_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/handy-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          # Self-signed, so trust it for code signing on this runner only.
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain .github/handy-signing-cert.pem \
+            || echo "Could not mark the certificate as trusted; signing anyway"
+          security find-identity -p codesigning "$KEYCHAIN"
+          echo "APPLE_SIGNING_IDENTITY=Handy Ponctuation Dictee" >> "$GITHUB_ENV"
 
       - name: Build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: bun run tauri build --target ${{ matrix.target }}
+
+      - name: Verify signature
+        run: |
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Handy.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          REQUIREMENT=$(codesign -d -r- "$APP" 2>&1)
+          echo "$REQUIREMENT"
+          if [ "$HAS_SIGNING_CERT" = "true" ] && echo "$REQUIREMENT" | grep -q cdhash; then
+            echo "Ad-hoc signature: macOS permissions would reset on every update" >&2
+            exit 1
+          fi
 
       - name: Verify bundled dylibs (Intel)
         if: matrix.target == 'x86_64-apple-darwin'
         run: |
-          APP=$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Handy.app"
           otool -L "$APP/Contents/MacOS/handy" | grep '@rpath/' | awk '{print $1}' | while read dep; do
             libname=$(basename "$dep")
             if [ ! -f "$APP/Contents/Frameworks/$libname" ]; then
@@ -108,10 +171,20 @@ jobs:
             echo "OK: $libname"
           done
 
+      # Both architectures produce Handy.app.tar.gz, so name them per arch.
+      - name: Collect release files
+        run: |
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p out
+          cp "$BUNDLE"/dmg/*.dmg out/
+          cp "$BUNDLE/macos/Handy.app.tar.gz" "out/Handy_${{ matrix.arch }}.app.tar.gz"
+          cp "$BUNDLE/macos/Handy.app.tar.gz.sig" "out/Handy_${{ matrix.arch }}.app.tar.gz.sig"
+          ls -la out
+
       - uses: actions/upload-artifact@v4
         with:
           name: handy-ponctuation-${{ matrix.target }}
-          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          path: out/*
           if-no-files-found: error
           retention-days: 30
 
@@ -129,20 +202,35 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # latest.json is what installed apps poll (plugins.updater.endpoints).
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mapfile -t DMGS < <(find dist -name '*.dmg')
-          if [ "${#DMGS[@]}" -eq 0 ]; then
-            echo "No .dmg produced" >&2
-            find dist >&2
-            exit 1
-          fi
-          printf 'Publishing %s\n' "${DMGS[@]}"
-          VERSION=$(grep -o '"version": "[^"]*"' src-tauri/tauri.conf.json | head -1 | cut -d'"' -f4)
-          gh release create "v${VERSION}-ponctuation.${{ github.run_number }}" "${DMGS[@]}" \
+          ls -la dist
+          BASE=$(jq -r .version src-tauri/tauri.conf.json)
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
+          VERSION="$MAJOR.$MINOR.$((PATCH * 1000 + ${{ github.run_number }}))"
+          TAG="v$VERSION"
+          URL="https://github.com/${{ github.repository }}/releases/download/$TAG"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg url "$URL" \
+            --arg arm_sig "$(cat dist/Handy_aarch64.app.tar.gz.sig)" \
+            --arg x64_sig "$(cat dist/Handy_x64.app.tar.gz.sig)" \
+            '{
+              version: $version,
+              notes: "Handy + ponctuation dictée",
+              pub_date: $date,
+              platforms: {
+                "darwin-aarch64": {signature: $arm_sig, url: ($url + "/Handy_aarch64.app.tar.gz")},
+                "darwin-x86_64": {signature: $x64_sig, url: ($url + "/Handy_x64.app.tar.gz")}
+              }
+            }' > dist/latest.json
+          cat dist/latest.json
+          gh release create "$TAG" dist/*.dmg dist/*.app.tar.gz dist/latest.json \
             --target "$GITHUB_SHA" \
-            --title "Handy ${VERSION} + ponctuation dictée" \
+            --title "Handy $VERSION + ponctuation dictée" \
             --notes-file .github/RELEASE_NOTES_PONCTUATION.md \
             --latest

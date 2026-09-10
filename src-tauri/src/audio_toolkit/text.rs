@@ -559,9 +559,18 @@ fn word_before(text: &str, start: usize) -> Option<String> {
     })
 }
 
-/// Returns the word directly after `end`, or `None` when punctuation follows.
+/// Returns the word directly after `end`, or `None` when punctuation or
+/// another spoken command follows. A command chain like "point à la ligne"
+/// marks the first word as a command even though "à" normally signals
+/// ordinary usage ("deux points à voir").
 fn word_after(text: &str, end: usize) -> Option<String> {
     let after = text[end..].trim_start();
+    if FRENCH_SPOKEN_COMMAND_PATTERN
+        .find(after)
+        .is_some_and(|next| next.start() == 0)
+    {
+        return None;
+    }
     let word_end = after
         .char_indices()
         .find(|(_, c)| !is_dictation_word_char(*c))
@@ -1253,6 +1262,29 @@ mod tests {
         assert_eq!(
             spoken_french("Il m'a dit ouvrez les guillemets bonjour fermez les guillemets"),
             "Il m'a dit « bonjour »"
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_point_chained_with_line_break() {
+        assert_eq!(
+            spoken_french("merci pour ton intervention point à la ligne cordialement"),
+            "merci pour ton intervention.\nCordialement"
+        );
+        assert_eq!(
+            spoken_french("Merci pour ton édition point nouveau paragraphe cordialement"),
+            "Merci pour ton édition.\n\nCordialement"
+        );
+        assert_eq!(
+            spoken_french(
+                "Bonjour Romain, nouveau paragraphe, merci pour ton intervention point à la ligne, à la ligne. Cordialement."
+            ),
+            "Bonjour Romain,\n\nMerci pour ton intervention.\n\nCordialement."
+        );
+        // "à" still marks ordinary usage when no command follows.
+        assert_eq!(
+            spoken_french("Il reste deux points à voir."),
+            "Il reste deux points à voir."
         );
     }
 

@@ -1,6 +1,6 @@
 use crate::audio_toolkit::{
-    apply_custom_words, detect_output_language, normalize_transcription_output,
-    remove_filler_words, OutputLanguageEvidence,
+    apply_custom_words, apply_spoken_punctuation, detect_output_language,
+    normalize_transcription_output, remove_filler_words, OutputLanguageEvidence,
 };
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::{EngineType, ModelManager};
@@ -1810,7 +1810,15 @@ fn post_process_transcription_text(
             settings.filler_word_removal_enabled,
         );
 
-        normalize_transcription_output(&without_fillers)
+        let normalized = normalize_transcription_output(&without_fillers);
+
+        // Runs last: normalization collapses whitespace and would erase the
+        // line breaks inserted for "à la ligne".
+        apply_spoken_punctuation(
+            &normalized,
+            &output_language,
+            settings.spoken_punctuation_enabled,
+        )
     })
 }
 

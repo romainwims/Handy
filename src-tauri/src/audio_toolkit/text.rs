@@ -433,6 +433,368 @@ pub fn normalize_transcription_output(text: &str) -> String {
     normalized.trim().to_string()
 }
 
+/// Symbol produced by a spoken dictation command such as "virgule" or
+/// "à la ligne".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpokenSymbol {
+    Comma,
+    Period,
+    Ellipsis,
+    QuestionMark,
+    ExclamationMark,
+    Colon,
+    Semicolon,
+    NewLine,
+    NewParagraph,
+    OpenParenthesis,
+    CloseParenthesis,
+    OpenQuote,
+    CloseQuote,
+}
+
+struct SpokenCommand {
+    /// Regex fragment without capturing groups, matched case-insensitively
+    /// between word boundaries.
+    pattern: &'static str,
+    symbol: SpokenSymbol,
+    /// The phrase is also an ordinary French expression ("le point", "une
+    /// nouvelle ligne de bus"). It is only converted when the output language
+    /// is French or unknown and the neighbouring words do not look like
+    /// ordinary usage.
+    ambiguous: bool,
+}
+
+const fn spoken(pattern: &'static str, symbol: SpokenSymbol, ambiguous: bool) -> SpokenCommand {
+    SpokenCommand {
+        pattern,
+        symbol,
+        ambiguous,
+    }
+}
+
+/// French dictation commands. Order matters: the combined regex uses
+/// leftmost-first alternation, so longer phrases must precede their prefixes
+/// ("point d'interrogation" before "point").
+const FRENCH_SPOKEN_COMMANDS: &[SpokenCommand] = &[
+    spoken(r"retour\s+à\s+la\s+ligne", SpokenSymbol::NewLine, false),
+    spoken(r"à\s+la\s+ligne", SpokenSymbol::NewLine, false),
+    spoken(r"saut\s+de\s+ligne", SpokenSymbol::NewLine, false),
+    spoken(r"nouvelle\s+ligne", SpokenSymbol::NewLine, true),
+    spoken(r"nouveau\s+paragraphe", SpokenSymbol::NewParagraph, true),
+    spoken(r"point[\s-]+d['’]\s*interrogation", SpokenSymbol::QuestionMark, false),
+    spoken(r"point[\s-]+d['’]\s*exclamation", SpokenSymbol::ExclamationMark, false),
+    spoken(r"point[\s-]+virgule", SpokenSymbol::Semicolon, false),
+    spoken(r"points\s+de\s+suspension", SpokenSymbol::Ellipsis, false),
+    spoken(r"trois\s+petits\s+points", SpokenSymbol::Ellipsis, false),
+    spoken(r"point\s+final", SpokenSymbol::Period, true),
+    spoken(r"deux[\s-]+points", SpokenSymbol::Colon, true),
+    spoken(r"point", SpokenSymbol::Period, true),
+    spoken(r"virgule", SpokenSymbol::Comma, false),
+    spoken(r"ouvr(?:ez|ir|e)\s+(?:la\s+)?parenth[èe]se", SpokenSymbol::OpenParenthesis, false),
+    spoken(r"ferm(?:ez|er|e)\s+(?:la\s+)?parenth[èe]se", SpokenSymbol::CloseParenthesis, false),
+    spoken(r"ouvr(?:ez|ir|e)\s+(?:les\s+)?guillemets?", SpokenSymbol::OpenQuote, false),
+    spoken(r"ferm(?:ez|er|e)\s+(?:les\s+)?guillemets?", SpokenSymbol::CloseQuote, false),
+];
+
+/// One capturing group per command, in table order, so the matching group
+/// index identifies the command.
+static FRENCH_SPOKEN_COMMAND_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    let alternatives: Vec<String> = FRENCH_SPOKEN_COMMANDS
+        .iter()
+        .map(|command| format!("({})", command.pattern))
+        .collect();
+    Regex::new(&format!(r"(?i)\b(?:{})\b", alternatives.join("|"))).unwrap()
+});
+
+/// Words that, right before an ambiguous command, show it is an ordinary noun
+/// ("le point", "une nouvelle ligne", "the point").
+const ORDINARY_USAGE_PRECEDING_WORDS: &[&str] = &[
+    "le", "la", "les", "l'", "un", "une", "des", "du", "de", "d'", "au", "aux", "à", "ce", "cet",
+    "cette", "ces", "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "notre", "nos",
+    "votre", "vos", "leur", "leurs", "quel", "quelle", "quels", "quelles", "chaque", "même",
+    "bon", "bonne", "premier", "première", "dernier", "dernière", "seul", "seule", "tel",
+    "telle", "en", "sur", "par", "quelques", "plusieurs", "the", "a", "an", "this", "that", "my",
+    "your", "his", "her", "our", "their", "no", "any", "some", "what", "whole", "main", "good",
+];
+
+/// Words that, right after an ambiguous command, show it is an ordinary noun
+/// ("point de vue", "deux points à voir", "gmail point com").
+const ORDINARY_USAGE_FOLLOWING_WORDS: &[&str] = &[
+    "de", "du", "des", "à", "au", "aux", "où", "en", "sur", "pour", "par", "qui", "que", "com",
+    "fr", "net", "org", "commun", "communs", "fort", "forts", "faible", "faibles", "important",
+    "importants", "importante", "importantes", "essentiel", "essentiels", "clé", "clés",
+    "principal", "principaux", "précis", "noir", "noirs", "mort", "positif", "positifs",
+    "négatif", "négatifs", "culminant", "central", "chaud", "chauds", "is", "of", "was", "in",
+    "that",
+];
+
+fn is_dictation_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '\'' | '’' | '-')
+}
+
+fn normalize_dictation_word(word: &str) -> String {
+    word.to_lowercase().replace('’', "'")
+}
+
+/// Returns the word directly before `start`, or `None` when the command is
+/// separated from it by punctuation, which marks it as a standalone command.
+fn word_before(text: &str, start: usize) -> Option<String> {
+    let before = text[..start].trim_end();
+    if !before.chars().next_back().is_some_and(is_dictation_word_char) {
+        return None;
+    }
+    let word_start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_dictation_word_char(*c))
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let word = normalize_dictation_word(&before[word_start..]);
+
+    // "jusqu'au point" -> "au", "d'un point" -> "un"
+    Some(match word.rsplit_once('\'') {
+        Some((_, tail)) if !tail.is_empty() => tail.to_string(),
+        _ => word,
+    })
+}
+
+/// Returns the word directly after `end`, or `None` when punctuation follows.
+fn word_after(text: &str, end: usize) -> Option<String> {
+    let after = text[end..].trim_start();
+    let word_end = after
+        .char_indices()
+        .find(|(_, c)| !is_dictation_word_char(*c))
+        .map(|(index, _)| index)
+        .unwrap_or(after.len());
+    (word_end > 0).then(|| normalize_dictation_word(&after[..word_end]))
+}
+
+fn looks_like_ordinary_usage(text: &str, start: usize, end: usize) -> bool {
+    let preceded = word_before(text, start)
+        .is_some_and(|word| ORDINARY_USAGE_PRECEDING_WORDS.contains(&word.as_str()));
+    let followed = word_after(text, end).is_some_and(|word| {
+        word.starts_with("d'")
+            || word.starts_with("qu'")
+            || ORDINARY_USAGE_FOLLOWING_WORDS.contains(&word.as_str())
+    });
+    preceded || followed
+}
+
+/// `\b` treats apostrophes and hyphens as boundaries; a command glued to one
+/// is part of a larger word ("Point-à-Pitre").
+fn is_joined_to_word(text: &str, start: usize, end: usize) -> bool {
+    let is_joiner = |c: char| matches!(c, '\'' | '’' | '-');
+    text[..start].chars().next_back().is_some_and(is_joiner)
+        || text[end..].chars().next().is_some_and(is_joiner)
+}
+
+/// Punctuation the speech model guessed around a spoken command. It is dropped
+/// so the dictated symbol wins ("Bonjour, virgule," -> "Bonjour,").
+fn is_model_punctuation(c: char) -> bool {
+    matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | '…')
+}
+
+fn trim_leading_model_punctuation(segment: &str) -> &str {
+    segment.trim_start_matches(|c: char| c.is_whitespace() || is_model_punctuation(c))
+}
+
+/// Trims the text preceding a command. Model punctuation right before a
+/// dictated mark is dropped; before a line break it is kept, since it usually
+/// closes the sentence ("Merci. À la ligne" -> "Merci.\n").
+fn trim_before_spoken_symbol(segment: &str, symbol: SpokenSymbol) -> &str {
+    let segment = segment.trim_end();
+    match symbol {
+        SpokenSymbol::NewLine | SpokenSymbol::NewParagraph => segment,
+        SpokenSymbol::OpenParenthesis | SpokenSymbol::OpenQuote => {
+            segment.trim_end_matches(|c: char| c == ',' || c.is_whitespace())
+        }
+        SpokenSymbol::CloseParenthesis | SpokenSymbol::CloseQuote => segment
+            .trim_end_matches(|c: char| matches!(c, ',' | ';' | ':' | '.') || c.is_whitespace()),
+        _ => segment.trim_end_matches(|c: char| c.is_whitespace() || is_model_punctuation(c)),
+    }
+}
+
+fn trim_trailing_spaces(output: &mut String) {
+    let trimmed_len = output.trim_end_matches(&[' ', '\t'][..]).len();
+    output.truncate(trimmed_len);
+}
+
+fn push_dictated_segment(
+    output: &mut String,
+    segment: &str,
+    previous: Option<SpokenSymbol>,
+    capitalize_next: &mut bool,
+) {
+    if segment.is_empty() {
+        return;
+    }
+
+    let joins_directly = matches!(
+        previous,
+        None | Some(
+            SpokenSymbol::NewLine
+                | SpokenSymbol::NewParagraph
+                | SpokenSymbol::OpenParenthesis
+                | SpokenSymbol::OpenQuote
+        )
+    );
+    if !joins_directly && !output.ends_with(char::is_whitespace) {
+        output.push(' ');
+    }
+
+    let mut chars = segment.chars();
+    if std::mem::take(capitalize_next) {
+        if let Some(first) = chars.next() {
+            output.extend(first.to_uppercase());
+        }
+    }
+    output.push_str(chars.as_str());
+}
+
+fn push_spoken_symbol(output: &mut String, symbol: SpokenSymbol, capitalize_next: &mut bool) {
+    match symbol {
+        SpokenSymbol::Comma
+        | SpokenSymbol::Period
+        | SpokenSymbol::Ellipsis
+        | SpokenSymbol::CloseParenthesis => {
+            trim_trailing_spaces(output);
+            output.push_str(match symbol {
+                SpokenSymbol::Comma => ",",
+                SpokenSymbol::Period => ".",
+                SpokenSymbol::Ellipsis => "...",
+                _ => ")",
+            });
+        }
+        // French typography puts a space before two-part punctuation.
+        SpokenSymbol::QuestionMark
+        | SpokenSymbol::ExclamationMark
+        | SpokenSymbol::Colon
+        | SpokenSymbol::Semicolon => {
+            trim_trailing_spaces(output);
+            if output.ends_with(|c: char| !c.is_whitespace() && !matches!(c, '?' | '!' | '(')) {
+                output.push(' ');
+            }
+            output.push(match symbol {
+                SpokenSymbol::QuestionMark => '?',
+                SpokenSymbol::ExclamationMark => '!',
+                SpokenSymbol::Colon => ':',
+                _ => ';',
+            });
+        }
+        SpokenSymbol::NewLine | SpokenSymbol::NewParagraph => {
+            trim_trailing_spaces(output);
+            output.push_str(if symbol == SpokenSymbol::NewLine {
+                "\n"
+            } else {
+                "\n\n"
+            });
+        }
+        SpokenSymbol::OpenParenthesis | SpokenSymbol::OpenQuote => {
+            if output.ends_with(|c: char| !c.is_whitespace() && !matches!(c, '(' | '«')) {
+                output.push(' ');
+            }
+            output.push_str(if symbol == SpokenSymbol::OpenParenthesis {
+                "("
+            } else {
+                "« "
+            });
+        }
+        SpokenSymbol::CloseQuote => {
+            trim_trailing_spaces(output);
+            output.push_str(" »");
+        }
+    }
+
+    *capitalize_next = match symbol {
+        SpokenSymbol::Period
+        | SpokenSymbol::QuestionMark
+        | SpokenSymbol::ExclamationMark
+        | SpokenSymbol::NewLine
+        | SpokenSymbol::NewParagraph => true,
+        // "à la ligne, ouvrez les guillemets, bonjour" -> "\n« Bonjour"
+        SpokenSymbol::OpenParenthesis | SpokenSymbol::OpenQuote => *capitalize_next,
+        _ => false,
+    };
+}
+
+/// Converts spoken French punctuation and layout commands into the symbols
+/// themselves: "Bonjour virgule à la ligne" becomes "Bonjour,\n".
+///
+/// Must run after [`normalize_transcription_output`], which collapses
+/// whitespace and would erase the inserted line breaks. Text between commands
+/// is kept verbatim; only punctuation the model guessed around a command is
+/// dropped, so the dictated symbol wins.
+///
+/// # Arguments
+/// * `text` - The normalized transcription text
+/// * `language` - Evidence for the output language. Ambiguous commands such as
+///   "point" are left alone when the output is known not to be French.
+/// * `enabled` - Whether spoken punctuation commands are enabled
+///
+/// # Returns
+/// The text with spoken commands replaced by punctuation and line breaks
+pub fn apply_spoken_punctuation(
+    text: &str,
+    language: &OutputLanguageEvidence,
+    enabled: bool,
+) -> String {
+    if !enabled {
+        return text.to_string();
+    }
+
+    let allow_ambiguous = language
+        .language()
+        .is_none_or(|lang| lang.split(&['-', '_'][..]).next() == Some("fr"));
+
+    let commands: Vec<(usize, usize, SpokenSymbol)> = FRENCH_SPOKEN_COMMAND_PATTERN
+        .captures_iter(text)
+        .filter_map(|captures| {
+            let whole = captures.get(0)?;
+            let command = FRENCH_SPOKEN_COMMANDS
+                .iter()
+                .enumerate()
+                .find(|(index, _)| captures.get(index + 1).is_some())
+                .map(|(_, command)| command)?;
+            let (start, end) = (whole.start(), whole.end());
+            if is_joined_to_word(text, start, end) {
+                return None;
+            }
+            if command.ambiguous
+                && (!allow_ambiguous || looks_like_ordinary_usage(text, start, end))
+            {
+                return None;
+            }
+            Some((start, end, command.symbol))
+        })
+        .collect();
+
+    if commands.is_empty() {
+        return text.to_string();
+    }
+
+    let mut output = String::with_capacity(text.len());
+    let mut capitalize_next = false;
+    let mut previous: Option<SpokenSymbol> = None;
+    let mut cursor = 0;
+
+    for (start, end, symbol) in commands {
+        let mut segment = &text[cursor..start];
+        if previous.is_some() {
+            segment = trim_leading_model_punctuation(segment);
+        }
+        segment = trim_before_spoken_symbol(segment, symbol);
+        push_dictated_segment(&mut output, segment, previous, &mut capitalize_next);
+        push_spoken_symbol(&mut output, symbol, &mut capitalize_next);
+        previous = Some(symbol);
+        cursor = end;
+    }
+
+    let tail = trim_leading_model_punctuation(&text[cursor..]);
+    push_dictated_segment(&mut output, tail, previous, &mut capitalize_next);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,5 +1186,137 @@ mod tests {
         let custom_words = vec!["你号".to_string()];
         let result = apply_custom_words(text, &custom_words, 1.0);
         assert_eq!(result, text);
+    }
+
+    fn spoken_french(text: &str) -> String {
+        apply_spoken_punctuation(
+            text,
+            &OutputLanguageEvidence::ModelDetected("fr".to_string()),
+            true,
+        )
+    }
+
+    #[test]
+    fn test_spoken_punctuation_comma_and_new_line() {
+        assert_eq!(
+            spoken_french("bonjour virgule à la ligne je voulais te dire merci"),
+            "bonjour,\nJe voulais te dire merci"
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_drops_model_punctuation_around_commands() {
+        assert_eq!(
+            spoken_french("Bonjour, virgule, à la ligne. Je voulais te dire merci."),
+            "Bonjour,\nJe voulais te dire merci."
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_keeps_sentence_end_before_new_line() {
+        assert_eq!(
+            spoken_french("Merci. À la ligne. Cordialement, Romain."),
+            "Merci.\nCordialement, Romain."
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_period_and_question_mark() {
+        assert_eq!(
+            spoken_french("je suis content point comment ça va point d'interrogation"),
+            "je suis content. Comment ça va ?"
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_new_paragraph_and_repeated_lines() {
+        assert_eq!(
+            spoken_french("Salut nouveau paragraphe merci à la ligne à la ligne ça va"),
+            "Salut\n\nMerci\n\nÇa va"
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_colon_semicolon_exclamation() {
+        assert_eq!(
+            spoken_french("Il y a deux options, deux points, la première point-virgule la seconde point d'exclamation"),
+            "Il y a deux options : la première ; la seconde !"
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_parentheses_and_quotes() {
+        assert_eq!(
+            spoken_french("J'ai vu Pierre, ouvrez la parenthèse, mon frère, fermez la parenthèse, hier."),
+            "J'ai vu Pierre (mon frère) hier."
+        );
+        assert_eq!(
+            spoken_french("Il m'a dit ouvrez les guillemets bonjour fermez les guillemets"),
+            "Il m'a dit « bonjour »"
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_keeps_trailing_new_line() {
+        assert_eq!(spoken_french("Cordialement à la ligne"), "Cordialement\n");
+    }
+
+    #[test]
+    fn test_spoken_punctuation_preserves_ordinary_uses_of_point() {
+        for text in [
+            "C'est le point important.",
+            "Quel est ton point de vue ?",
+            "Il faut mettre un point final à cette histoire.",
+            "J'ai marqué deux points de plus.",
+            "Une nouvelle ligne de bus ouvre.",
+            "Écris-moi sur gmail point com",
+            "Il habite à Point-à-Pitre",
+            "C'est un point d'honneur.",
+        ] {
+            assert_eq!(spoken_french(text), text);
+        }
+    }
+
+    #[test]
+    fn test_spoken_punctuation_leaves_untouched_text_verbatim() {
+        assert_eq!(
+            spoken_french("Ça coûte 3,5 euros virgule voir gmail.com"),
+            "Ça coûte 3,5 euros, voir gmail.com"
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_ambiguous_commands_need_french_or_unknown() {
+        let english = OutputLanguageEvidence::ModelDetected("en".to_string());
+        assert_eq!(
+            apply_spoken_punctuation("the answer point done", &english, true),
+            "the answer point done"
+        );
+        assert_eq!(
+            apply_spoken_punctuation("the point is simple", &OutputLanguageEvidence::Unknown, true),
+            "the point is simple"
+        );
+        // Unambiguous French commands still apply.
+        assert_eq!(
+            apply_spoken_punctuation("hello virgule world", &english, true),
+            "hello, world"
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_disabled() {
+        let text = "bonjour virgule à la ligne";
+        assert_eq!(
+            apply_spoken_punctuation(text, &OutputLanguageEvidence::Unknown, false),
+            text
+        );
+    }
+
+    #[test]
+    fn test_spoken_punctuation_survives_normalization_order() {
+        // Normalization collapses whitespace, so spoken punctuation must run
+        // after it for line breaks to survive.
+        let normalized = normalize_transcription_output("  Bonjour   à la ligne   Pierre  ");
+        assert_eq!(spoken_french(&normalized), "Bonjour\nPierre");
     }
 }

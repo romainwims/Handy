@@ -398,6 +398,10 @@
       "fillerWordRemoval": {
         "title": "Supprimer les mots de remplissage",
         "description": "Supprime les hésitations courantes des transcriptions. Désactivez cette option pour les conserver."
+      },
+      "spokenPunctuation": {
+        "title": "Ponctuation dictée",
+        "description": "Transforme les commandes vocales en mise en forme : « virgule » → ,  « point » → .  « à la ligne » → retour à la ligne, « nouveau paragraphe », « point d'interrogation », « deux points », « ouvrez/fermez la parenthèse »…"
       }
     },
     "postProcessing": {

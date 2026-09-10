@@ -398,6 +398,10 @@
       "fillerWordRemoval": {
         "title": "Remove Filler Words",
         "description": "Removes common hesitation words from transcriptions. Turn off to keep them."
+      },
+      "spokenPunctuation": {
+        "title": "Spoken Punctuation (French)",
+        "description": "Turns spoken commands into formatting: \"virgule\" → comma, \"point\" → period, \"à la ligne\" → line break, \"nouveau paragraphe\", \"point d'interrogation\", \"deux points\", \"ouvrez/fermez la parenthèse\"…"
       }
     },
     "postProcessing": {

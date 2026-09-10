@@ -490,6 +490,10 @@ pub struct AppSettings {
     pub filler_word_removal_enabled: bool,
     #[serde(default)]
     pub custom_filler_words: Option<Vec<String>>,
+    /// Convert spoken commands ("virgule", "à la ligne") into punctuation and
+    /// line breaks instead of typing the words.
+    #[serde(default = "default_spoken_punctuation_enabled")]
+    pub spoken_punctuation_enabled: bool,
     #[serde(default)]
     pub transcribe_accelerator: TranscribeAcceleratorSetting,
     #[serde(default)]
@@ -582,6 +586,10 @@ fn default_vad_enabled() -> bool {
 }
 
 fn default_filler_word_removal_enabled() -> bool {
+    true
+}
+
+fn default_spoken_punctuation_enabled() -> bool {
     true
 }
 
@@ -963,6 +971,7 @@ pub fn get_default_settings() -> AppSettings {
         external_script_path: None,
         filler_word_removal_enabled: default_filler_word_removal_enabled(),
         custom_filler_words: None,
+        spoken_punctuation_enabled: default_spoken_punctuation_enabled(),
         transcribe_accelerator: TranscribeAcceleratorSetting::default(),
         ort_accelerator: OrtAcceleratorSetting::default(),
         transcribe_gpu_device: default_transcribe_gpu_device(),

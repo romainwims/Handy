@@ -1,0 +1,100 @@
+name: "Build ponctuation dictée (macOS)"
+
+# Unsigned macOS build of this fork, published as a GitHub release so the
+# .dmg can be downloaded without a GitHub account. Upstream's build workflows
+# require the maintainer's Apple and updater signing secrets, which a fork
+# does not have.
+
+on:
+  push:
+    branches: [ponctuation-dictee]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spoken-punctuation-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # text.rs only depends on these crates, so its unit tests run in a tiny
+      # standalone crate instead of compiling the whole app.
+      - name: Run text cleanup unit tests
+        run: |
+          CRATE="$RUNNER_TEMP/texttests"
+          mkdir -p "$CRATE/src"
+          cat > "$CRATE/Cargo.toml" <<'EOF'
+          [package]
+          name = "texttests"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          natural = "0.5.0"
+          once_cell = "1"
+          regex = "1"
+          strsim = "0.11.0"
+          EOF
+          printf '#![allow(dead_code)]\n#[path = "%s/src-tauri/src/audio_toolkit/text.rs"]\nmod text;\n' "$GITHUB_WORKSPACE" > "$CRATE/src/lib.rs"
+          cd "$CRATE" && cargo test
+
+  build:
+    needs: spoken-punctuation-tests
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-26" # Apple Silicon (M1 and above)
+            args: "--target aarch64-apple-darwin"
+            target: "aarch64-apple-darwin"
+          - platform: "macos-latest" # Intel
+            args: "--target x86_64-apple-darwin"
+            target: "x86_64-apple-darwin"
+    uses: ./.github/workflows/build.yml
+    with:
+      platform: ${{ matrix.platform }}
+      target: ${{ matrix.target }}
+      build-args: ${{ matrix.args }}
+      sign-binaries: false
+      asset-prefix: "handy-ponctuation"
+      upload-artifacts: true
+    secrets: inherit
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: handy-ponctuation-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -t DMGS < <(find dist -name '*.dmg')
+          if [ "${#DMGS[@]}" -eq 0 ]; then
+            echo "No .dmg produced" >&2
+            find dist >&2
+            exit 1
+          fi
+          printf 'Publishing %s\n' "${DMGS[@]}"
+          VERSION=$(grep -o '"version": "[^"]*"' src-tauri/tauri.conf.json | head -1 | cut -d'"' -f4)
+          gh release create "v${VERSION}-ponctuation.${{ github.run_number }}" "${DMGS[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "Handy ${VERSION} + ponctuation dictée" \
+            --notes-file .github/RELEASE_NOTES_PONCTUATION.md \
+            --latest

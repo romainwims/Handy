@@ -116,7 +116,8 @@ jobs:
             src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
           # Hardened runtime library validation expects the bundled dylib to
           # share an Apple Team ID, which a self-signed certificate lacks.
-          plutil -insert com.apple.security.cs.disable-library-validation -bool true src-tauri/Entitlements.plist
+          # PlistBuddy, not plutil: plutil treats the dots as a key path.
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.disable-library-validation bool true" src-tauri/Entitlements.plist
 
       - name: Import signing certificate
         if: env.HAS_SIGNING_CERT == 'true'
